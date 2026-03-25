@@ -592,7 +592,10 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0
 
 # ── Local model ───────────────────────────────────────────────────────────────
 #LOCAL_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "all-MiniLM-L6-v2")
-LOCAL_MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "all-MiniLM-L6-v2")
+
+#LOCAL_MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "all-MiniLM-L6-v2")
+
+LOCAL_MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "essay-grader-finetuned")
 _local_model = None  # lazy-loaded on first use
 
 # Similarity below this = low confidence → flagged for teacher review
@@ -711,174 +714,251 @@ def get_local_model():
     return _local_model
 
 
-def grade_with_local_model(assignment, essay_text: str, word_count: int) -> dict:
-    """
-    Grade essay using the local all-MiniLM-L6-v2 sentence similarity model.
 
-    Pipeline:
-      1. Build reference text from assignment instructions + reference material.
-      2. Encode both texts into sentence embeddings.
-      3. Cosine similarity (0.0–1.0) = confidence/relevance score.
-      4. Apply word-count penalties for very short essays.
-      5. Map similarity to score, flag low-confidence submissions.
+def grade_with_local_model(assignment, essay_text: str, word_count: int = 0) -> dict:
+    model = get_local_model()
 
-    Confidence bands:
-      >= 60%  → Normal grade, decent confidence
-      35–59%  → Grade given, flagged LOW CONFIDENCE for teacher review
-      15–34%  → Very weak match, score heavily penalised, flagged
-      < 15%   → Off-topic
-    """
-    from sentence_transformers import util
+    title        = (assignment.title or "").strip()
+    instructions = (assignment.instructions or "").strip()
+    ref_material = (assignment.reference_material or "")[:1500].strip()
 
-    model     = get_local_model()
-    max_score = assignment.max_score
+    # Build multiple reference sentences and average them
+    refs = [
+        f"{title}. {instructions}",
+        f"{title}. {title}. {instructions}",
+        f"{instructions} {ref_material}" if ref_material else instructions,
+    ]
 
-    # Build reference text
-    reference = (assignment.instructions or "").strip()
-    if assignment.reference_material and assignment.reference_material.strip():
-        reference += " " + assignment.reference_material[:1500]
-    if not reference:
-        reference = assignment.title or "essay"
+    anchored_essay = f"{title}. {essay_text[:2500]}"
 
-    # Encode both texts
-    ref_emb   = model.encode(reference,         convert_to_tensor=True)
-    essay_emb = model.encode(essay_text[:2500],  convert_to_tensor=True)
+    ref_embeddings   = model.encode(refs, convert_to_tensor=True)
+    essay_embedding  = model.encode([anchored_essay], convert_to_tensor=True)
 
-    # Cosine similarity → confidence
-    similarity     = float(util.cos_sim(ref_emb, essay_emb)[0][0])
-    confidence_pct = round(similarity * 100, 1)
+    # Take the MAX similarity across all reference variants
+    from sentence_transformers import util as st_util
+    scores = st_util.cos_sim(essay_embedding, ref_embeddings)[0]
+    raw_similarity = float(scores.max().item())
 
-    # Word-count penalty applied to similarity before scoring
-    if word_count < 50:
-        similarity *= 0.10
-    elif word_count < 100:
-        similarity *= 0.30
-    elif word_count < 200:
-        similarity *= 0.60
-    elif word_count < 300:
-        similarity *= 0.80
-    # 300+ words → no penalty
+    # Scale: map 0.2–0.9 range → 0–100
+    low, high = 0.20, 0.90
+    scaled = (raw_similarity - low) / (high - low)
+    scaled = max(0.0, min(1.0, scaled))
 
-    raw_score = max(0, min(max_score, round(similarity * max_score)))
+    max_score      = assignment.max_score or 100
+    confidence_pct = raw_similarity * 100
 
-    off_topic      = confidence_pct < 15
-    low_confidence = (not off_topic) and (confidence_pct < CONFIDENCE_THRESHOLD * 100)
+    # Word count penalty
+    expected_words = 150
+    wc_ratio       = min(word_count / expected_words, 1.0) if word_count > 0 else 0.5
+    wc_factor      = 0.7 + (0.3 * wc_ratio)
 
-    print(
-        f"🖥️  Local model → raw_similarity={confidence_pct}% | "
-        f"score={raw_score}/{max_score} | "
-        f"off_topic={off_topic} | low_confidence={low_confidence}"
-    )
+    base_score    = scaled * max_score * wc_factor
+    off_topic     = confidence_pct < 10
+    low_confidence = confidence_pct < 35
 
-    # Build feedback message
     if off_topic:
-        feedback = (
-            f"❌ OFF-TOPIC SUBMISSION\n\n"
-            f"The assignment asked: \"{assignment.title}\"\n"
-            f"Your essay does not appear to address this topic "
-            f"(relevance: {confidence_pct}%).\n\n"
-            f"Score capped at {raw_score}/{max_score}. "
-            f"Please reread the instructions and resubmit."
-        )
+        final_score = min(base_score, max_score * 0.05)
     elif low_confidence:
-        if confidence_pct < 35:
-            feedback = (
-                f"⚠️ LOW CONFIDENCE GRADE (local AI)\n\n"
-                f"Your essay weakly addresses the assignment topic "
-                f"(relevance: {confidence_pct}%).\n"
-                f"Score: {raw_score}/{max_score} — pending teacher review.\n\n"
-                f"Consider expanding your answer to better address: \"{assignment.title}\""
-            )
-        else:
-            feedback = (
-                f"📝 LOW CONFIDENCE GRADE (local AI)\n\n"
-                f"Your essay partially addresses the topic "
-                f"(relevance: {confidence_pct}%).\n"
-                f"Score: {raw_score}/{max_score} — pending teacher review.\n\n"
-                f"Try to connect your points more directly to the assignment question."
-            )
-    elif confidence_pct >= 80:
-        feedback = (
-            f"✅ Good essay! Your response closely addresses the assignment "
-            f"(relevance: {confidence_pct}%).\n"
-            f"Score: {raw_score}/{max_score} — graded by local AI, pending teacher confirmation."
-        )
+        final_score = base_score * 0.75
     else:
-        feedback = (
-            f"📝 Your essay addresses the topic (relevance: {confidence_pct}%).\n"
-            f"Score: {raw_score}/{max_score} — graded by local AI, pending teacher review."
-        )
+        final_score = base_score
+
+    final_score = round(max(0, min(final_score, max_score)))
+
+    print(f"🖥️  Local model → raw_similarity={confidence_pct:.1f}% | score={final_score}/{max_score} | off_topic={off_topic} | low_confidence={low_confidence}")
 
     return {
-        "score":          raw_score,
-        "feedback":       feedback,
-        "ai_detected":    False,
-        "off_topic":      off_topic,
+        "score": final_score,
+        "max_score": max_score,
+        "feedback": f"Score: {final_score}/{max_score}. {'Essay appears off-topic.' if off_topic else 'Low confidence — flagged for teacher review.' if low_confidence else 'Graded successfully.'}",
+        "ai_detected": False,
+        "off_topic": off_topic,
         "low_confidence": low_confidence,
-        "confidence_pct": confidence_pct,
-        "graded_by":      "local_model",
+        "graded_by": "local_model",
     }
+
+
+
+# def grade_with_local_model(assignment, essay_text: str, word_count: int) -> dict:
+#     """
+#     Grade essay using the local all-MiniLM-L6-v2 sentence similarity model.
+
+#     Pipeline:
+#       1. Build reference text from assignment instructions + reference material.
+#       2. Encode both texts into sentence embeddings.
+#       3. Cosine similarity (0.0–1.0) = confidence/relevance score.
+#       4. Apply word-count penalties for very short essays.
+#       5. Map similarity to score, flag low-confidence submissions.
+
+#     Confidence bands:
+#       >= 60%  → Normal grade, decent confidence
+#       35–59%  → Grade given, flagged LOW CONFIDENCE for teacher review
+#       15–34%  → Very weak match, score heavily penalised, flagged
+#       < 15%   → Off-topic
+#     """
+#     from sentence_transformers import util
+
+#     model     = get_local_model()
+#     max_score = assignment.max_score
+
+#     # Build reference text
+#     reference = (assignment.instructions or "").strip()
+#     if assignment.reference_material and assignment.reference_material.strip():
+#         reference += " " + assignment.reference_material[:1500]
+#     if not reference:
+#         reference = assignment.title or "essay"
+
+#     # Encode both texts
+#     ref_emb   = model.encode(reference,         convert_to_tensor=True)
+#     essay_emb = model.encode(essay_text[:2500],  convert_to_tensor=True)
+
+#     # Cosine similarity → confidence
+#     similarity     = float(util.cos_sim(ref_emb, essay_emb)[0][0])
+#     confidence_pct = round(similarity * 100, 1)
+
+#     # Word-count penalty applied to similarity before scoring
+#     if word_count < 50:
+#         similarity *= 0.10
+#     elif word_count < 100:
+#         similarity *= 0.30
+#     elif word_count < 200:
+#         similarity *= 0.60
+#     elif word_count < 300:
+#         similarity *= 0.80
+#     # 300+ words → no penalty
+
+#     raw_score = max(0, min(max_score, round(similarity * max_score)))
+
+#     off_topic      = confidence_pct < 15
+#     low_confidence = (not off_topic) and (confidence_pct < CONFIDENCE_THRESHOLD * 100)
+
+#     print(
+#         f"🖥️  Local model → raw_similarity={confidence_pct}% | "
+#         f"score={raw_score}/{max_score} | "
+#         f"off_topic={off_topic} | low_confidence={low_confidence}"
+#     )
+
+#     # Build feedback message
+#     if off_topic:
+#         feedback = (
+#             f"❌ OFF-TOPIC SUBMISSION\n\n"
+#             f"The assignment asked: \"{assignment.title}\"\n"
+#             f"Your essay does not appear to address this topic "
+#             f"(relevance: {confidence_pct}%).\n\n"
+#             f"Score capped at {raw_score}/{max_score}. "
+#             f"Please reread the instructions and resubmit."
+#         )
+#     elif low_confidence:
+#         if confidence_pct < 35:
+#             feedback = (
+#                 f"⚠️ LOW CONFIDENCE GRADE (local AI)\n\n"
+#                 f"Your essay weakly addresses the assignment topic "
+#                 f"(relevance: {confidence_pct}%).\n"
+#                 f"Score: {raw_score}/{max_score} — pending teacher review.\n\n"
+#                 f"Consider expanding your answer to better address: \"{assignment.title}\""
+#             )
+#         else:
+#             feedback = (
+#                 f"📝 LOW CONFIDENCE GRADE (local AI)\n\n"
+#                 f"Your essay partially addresses the topic "
+#                 f"(relevance: {confidence_pct}%).\n"
+#                 f"Score: {raw_score}/{max_score} — pending teacher review.\n\n"
+#                 f"Try to connect your points more directly to the assignment question."
+#             )
+#     elif confidence_pct >= 80:
+#         feedback = (
+#             f"✅ Good essay! Your response closely addresses the assignment "
+#             f"(relevance: {confidence_pct}%).\n"
+#             f"Score: {raw_score}/{max_score} — graded by local AI, pending teacher confirmation."
+#         )
+#     else:
+#         feedback = (
+#             f"📝 Your essay addresses the topic (relevance: {confidence_pct}%).\n"
+#             f"Score: {raw_score}/{max_score} — graded by local AI, pending teacher review."
+#         )
+
+#     return {
+#         "score":          raw_score,
+#         "feedback":       feedback,
+#         "ai_detected":    False,
+#         "off_topic":      off_topic,
+#         "low_confidence": low_confidence,
+#         "confidence_pct": confidence_pct,
+#         "graded_by":      "local_model",
+#     }
 
 
 # ── Main grading dispatcher ───────────────────────────────────────────────────
 
 def grade_with_ai(prompt: str, assignment=None, essay_text: str = "", word_count: int = 0) -> dict:
-    """
-    Full grading pipeline:
-      1. Gemini API        — best quality
-      2. HuggingFace API   — good quality, 4 model fallbacks
-      3. Local model       — offline fallback with confidence scoring
-
-    Always returns a parsed dict:
-      score, feedback, ai_detected, off_topic, low_confidence, graded_by
-    """
-    max_score = assignment.max_score if assignment else 100
-
-    # ── Step 1: Gemini ────────────────────────────────────────────────────────
-    if GEMINI_API_KEY:
-        try:
-            print("🤖 Trying Gemini for grading...")
-            raw    = call_gemini(prompt)
-            parsed = parse_ai_response(raw, max_score)
-            parsed.setdefault("low_confidence", False)
-            parsed.setdefault("graded_by", "gemini")
-            print("✅ Gemini graded successfully")
-            return parsed
-        except http_requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 429:
-                print("⏳ Gemini 429 rate limit — waiting 65s then retrying...")
-                time.sleep(65)
-                try:
-                    raw    = call_gemini(prompt)
-                    parsed = parse_ai_response(raw, max_score)
-                    parsed.setdefault("low_confidence", False)
-                    parsed.setdefault("graded_by", "gemini")
-                    print("✅ Gemini retry succeeded")
-                    return parsed
-                except Exception as retry_err:
-                    print(f"⚠️ Gemini retry failed: {retry_err} — trying HuggingFace...")
-            else:
-                print(f"⚠️ Gemini HTTP error: {e} — trying HuggingFace...")
-        except Exception as e:
-            print(f"⚠️ Gemini failed: {e} — trying HuggingFace...")
-
-    # ── Step 2: HuggingFace API ───────────────────────────────────────────────
-    if HF_API_KEY:
-        try:
-            raw    = call_huggingface(prompt)
-            parsed = parse_ai_response(raw, max_score)
-            parsed.setdefault("low_confidence", False)
-            parsed.setdefault("graded_by", "huggingface")
-            return parsed
-        except Exception as e:
-            print(f"⚠️ All HuggingFace models failed: {e} — switching to local model...")
-
-    # ── Step 3: Local model ───────────────────────────────────────────────────
+    # ── Local model ONLY (Gemini + HuggingFace temporarily disabled) ──────────
     if assignment and essay_text:
-        print("🖥️  Using local model as final fallback...")
+        print("🖥️  Using local model...")
         return grade_with_local_model(assignment, essay_text, word_count)
 
-    raise Exception("All grading methods exhausted (Gemini, HuggingFace, local model).")
+    raise Exception("No grading method available.")
+
+
+
+
+
+# def grade_with_ai(prompt: str, assignment=None, essay_text: str = "", word_count: int = 0) -> dict:
+#     """
+#     Full grading pipeline:
+#       1. Gemini API        — best quality
+#       2. HuggingFace API   — good quality, 4 model fallbacks
+#       3. Local model       — offline fallback with confidence scoring
+
+#     Always returns a parsed dict:
+#       score, feedback, ai_detected, off_topic, low_confidence, graded_by
+#     """
+#     max_score = assignment.max_score if assignment else 100
+
+#     # ── Step 1: Gemini ────────────────────────────────────────────────────────
+#     if GEMINI_API_KEY:
+#         try:
+#             print("🤖 Trying Gemini for grading...")
+#             raw    = call_gemini(prompt)
+#             parsed = parse_ai_response(raw, max_score)
+#             parsed.setdefault("low_confidence", False)
+#             parsed.setdefault("graded_by", "gemini")
+#             print("✅ Gemini graded successfully")
+#             return parsed
+#         except http_requests.exceptions.HTTPError as e:
+#             if e.response is not None and e.response.status_code == 429:
+#                 print("⏳ Gemini 429 rate limit — waiting 65s then retrying...")
+#                 time.sleep(12)
+#                 try:
+#                     raw    = call_gemini(prompt)
+#                     parsed = parse_ai_response(raw, max_score)
+#                     parsed.setdefault("low_confidence", False)
+#                     parsed.setdefault("graded_by", "gemini")
+#                     print("✅ Gemini retry succeeded")
+#                     return parsed
+#                 except Exception as retry_err:
+#                     print(f"⚠️ Gemini retry failed: {retry_err} — trying HuggingFace...")
+#             else:
+#                 print(f"⚠️ Gemini HTTP error: {e} — trying HuggingFace...")
+#         except Exception as e:
+#             print(f"⚠️ Gemini failed: {e} — trying HuggingFace...")
+
+#     # ── Step 2: HuggingFace API ───────────────────────────────────────────────
+#     if HF_API_KEY:
+#         try:
+#             raw    = call_huggingface(prompt)
+#             parsed = parse_ai_response(raw, max_score)
+#             parsed.setdefault("low_confidence", False)
+#             parsed.setdefault("graded_by", "huggingface")
+#             return parsed
+#         except Exception as e:
+#             print(f"⚠️ All HuggingFace models failed: {e} — switching to local model...")
+
+#     # ── Step 3: Local model ───────────────────────────────────────────────────
+#     if assignment and essay_text:
+#         print("🖥️  Using local model as final fallback...")
+#         return grade_with_local_model(assignment, essay_text, word_count)
+
+#     raise Exception("All grading methods exhausted (Gemini, HuggingFace, local model).")
 
 
 # ── Response parser ───────────────────────────────────────────────────────────
