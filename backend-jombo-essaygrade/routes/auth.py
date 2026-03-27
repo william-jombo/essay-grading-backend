@@ -81,8 +81,8 @@ def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
         expires  = cookie_expires,
         path     = "/",
         httponly = True,
-        samesite = "lax",
-        secure   = False,
+        samesite = "none",
+        secure   = True,
     )
 
     # csrf_token cookie — httponly=False (JS needs to read it, matches PHP)
@@ -92,8 +92,8 @@ def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)):
         expires  = cookie_expires,
         path     = "/",
         httponly = False,
-        samesite = "lax",
-        secure   = False,
+        samesite = "none",
+        secure   = True,
     )
 
     return response

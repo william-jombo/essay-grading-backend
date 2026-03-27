@@ -15,10 +15,12 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:3000",
+        "https://essaygrade.vercel.app",
+        "https://jombo-essaygrade.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["Content-Type", "X-CSRF-Token"],
+    allow_headers=["*"],
 )
 
 app.include_router(auth.router,    prefix="/api/auth",    tags=["Auth"])
