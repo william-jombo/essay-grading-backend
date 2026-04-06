@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from routes import auth, teacher, student, exams
 
 load_dotenv()
 
@@ -26,6 +27,7 @@ app.add_middleware(
 app.include_router(auth.router,    prefix="/api/auth",    tags=["Auth"])
 app.include_router(teacher.router, prefix="/api/teacher", tags=["Teacher"])
 app.include_router(student.router, prefix="/api/student", tags=["Student"])
+app.include_router(exams.router, prefix="/api/teacher", tags=["Exams"])
 
 @app.get("/")
 def root():
